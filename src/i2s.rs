@@ -21,7 +21,7 @@ impl I2s2Tx {
         let odd = (divider & 0x01) != 0;
 
         pac::SPI2.ctlr1().modify(|w| w.set_spe(false));
-        pac::SPI2.i2scfgr().modify(|w| w.set_i2se(false));
+        pac::SPI2.i2s_cfgr().modify(|w| w.set_i2se(false));
 
         pac::SPI2.i2spr().write(|w| {
             w.set_mckoe(false);
@@ -29,7 +29,7 @@ impl I2s2Tx {
             w.set_i2sdiv(prescaler as u8);
         });
 
-        pac::SPI2.i2scfgr().write(|w| {
+        pac::SPI2.i2s_cfgr().write(|w| {
             w.set_chlen(pac::spi::vals::Chlen::BIT16);
             w.set_datlen(pac::spi::vals::I2sdatlen::BIT16);
             w.set_ckpol(false);

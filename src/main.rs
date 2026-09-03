@@ -9,9 +9,10 @@ use embassy_executor::Spawner;
 use embassy_futures::join::join3;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
-use embassy_usb::driver::EndpointError;
+use embassy_usb::driver::{Endpoint, EndpointError, EndpointOut};
 use embassy_usb::Builder;
 use panic_halt as _;
+use static_cell::StaticCell;
 
 mod audio;
 mod i2s;
@@ -21,6 +22,7 @@ bind_interrupts!(struct Irq {
 });
 
 static AUDIO_QUEUE: Channel<CriticalSectionRawMutex, UsbPacket, 8> = Channel::new();
+static AUDIO_HANDLER: StaticCell<audio::UsbAudioClass> = StaticCell::new();
 
 #[derive(Clone, Copy)]
 struct UsbPacket {
@@ -50,7 +52,8 @@ async fn main(_spawner: Spawner) -> ! {
     let _i2s_ck = p.PB13;
     let _i2s_sd = p.PB15;
 
-    let mut endpoint_buffers: [EndpointDataBuffer512; 1] = core::array::from_fn(|_| EndpointDataBuffer512::default());
+    let mut endpoint_buffers: [EndpointDataBuffer512; 1] =
+        core::array::from_fn(|_| EndpointDataBuffer512::default());
     let driver = Driver::new(p.OTG_FS, p.PA12, p.PA11, &mut endpoint_buffers);
 
     let mut usb_config = embassy_usb::Config::new(0x1209, 0x3050);
@@ -78,8 +81,9 @@ async fn main(_spawner: Spawner) -> ! {
         &mut control_buf,
     );
 
-    let (mut audio_handler, mut stream_endpoint) = audio::UsbAudioClass::new(&mut builder);
-    builder.handler(&mut audio_handler);
+    let (audio_handler, mut stream_endpoint) = audio::UsbAudioClass::new(&mut builder);
+    let audio_handler = AUDIO_HANDLER.init(audio_handler);
+    builder.handler(audio_handler);
 
     let mut usb = builder.build();
     let mut i2s = i2s::I2s2Tx::new();

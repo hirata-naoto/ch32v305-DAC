@@ -20,6 +20,7 @@ embassy-usb = "0.5.1"
 embassy-usb-driver = "=0.2.0"
 heapless = { version = "0.8.0", default-features = false }
 panic-halt = "1.0.0"
+qingke = { version = "0.7.0", features = ["unsafe-trust-wch-atomics"] }
 qingke-rt = "0.7.0"
 static_cell = "2.1.0"
 

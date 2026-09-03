@@ -10,7 +10,8 @@ pub const SAMPLE_RATE_HZ: u32 = 48_000;
 pub const CHANNEL_COUNT: usize = 2;
 pub const BYTES_PER_SAMPLE: usize = 2;
 pub const BITS_PER_SAMPLE: u8 = 16;
-pub const USB_PACKET_SIZE: usize = (SAMPLE_RATE_HZ as usize / 1_000) * CHANNEL_COUNT * BYTES_PER_SAMPLE;
+pub const USB_PACKET_SIZE: usize =
+    (SAMPLE_RATE_HZ as usize / 1_000) * CHANNEL_COUNT * BYTES_PER_SAMPLE;
 
 pub static STREAM_ACTIVE: AtomicBool = AtomicBool::new(false);
 
@@ -81,14 +82,7 @@ impl UsbAudioClass {
         );
         ac_alt.descriptor(
             CS_INTERFACE,
-            &[
-                AC_CLOCK_SOURCE,
-                CLOCK_SOURCE_ID,
-                0x01,
-                0x01,
-                0x00,
-                0x00,
-            ],
+            &[AC_CLOCK_SOURCE, CLOCK_SOURCE_ID, 0x01, 0x01, 0x00, 0x00],
         );
         ac_alt.descriptor(
             CS_INTERFACE,
@@ -162,7 +156,12 @@ impl UsbAudioClass {
         );
         as_alt.descriptor(
             CS_INTERFACE,
-            &[AS_FORMAT_TYPE, 0x01, BYTES_PER_SAMPLE as u8, BITS_PER_SAMPLE],
+            &[
+                AS_FORMAT_TYPE,
+                0x01,
+                BYTES_PER_SAMPLE as u8,
+                BITS_PER_SAMPLE,
+            ],
         );
 
         let stream_endpoint = as_alt.endpoint_isochronous_out(
