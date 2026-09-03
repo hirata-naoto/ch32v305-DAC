@@ -16,6 +16,9 @@ impl<'d> I2s2Tx<'d> {
         configure_gpio_port_b_pin_af(13);
         configure_gpio_port_b_pin_af(15);
 
+        let mut dma_options = TransferOptions::default();
+        dma_options.priority = Priority::VeryHigh;
+
         let dma_ring = unsafe {
             // DMA は SPI2 のデータレジスタへ 16-bit PCM を順番に流し込む。
             WritableRingBuffer::new(
@@ -23,10 +26,7 @@ impl<'d> I2s2Tx<'d> {
                 (),
                 pac::SPI2.datar().as_ptr() as *mut u16,
                 dma_buffer,
-                TransferOptions {
-                    priority: Priority::VeryHigh,
-                    ..Default::default()
-                },
+                dma_options,
             )
         };
 
