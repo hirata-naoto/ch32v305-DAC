@@ -42,11 +42,13 @@ impl Default for UsbPacket {
 #[embassy_executor::main(entry = "qingke_rt::entry")]
 async fn main(_spawner: Spawner) -> ! {
     let config = Config {
+        // USB/I2S のタイミング計算を 144 MHz 前提でそろえる。
         rcc: hal::rcc::Config::SYSCLK_FREQ_144MHZ_HSI,
         ..Default::default()
     };
     let p = hal::init(config);
 
+    // SPI2/I2S2 に割り当てるピンを確保して他用途への再利用を防ぐ。
     let _spi2 = p.SPI2;
     let _i2s_ws = p.PB12;
     let _i2s_ck = p.PB13;
@@ -72,6 +74,7 @@ async fn main(_spawner: Spawner) -> ! {
     let mut msos_descriptor = [0; 64];
     let mut control_buf = [0; 64];
 
+    // USB Audio Class の各種記述子とエンドポイントを組み立てる。
     let mut builder = Builder::new(
         driver,
         usb_config,
@@ -98,6 +101,7 @@ async fn main(_spawner: Spawner) -> ! {
                 let mut packet = UsbPacket::default();
                 match stream_endpoint.read(&mut packet.data).await {
                     Ok(received) => {
+                        // USB 等時転送で受けた 1 ms 分の PCM を再生キューへ渡す。
                         packet.len = received;
                         AUDIO_QUEUE.send(packet).await;
                     }
@@ -110,6 +114,7 @@ async fn main(_spawner: Spawner) -> ! {
     let playback_fut = async {
         loop {
             let packet = AUDIO_QUEUE.receive().await;
+            // 受信順を保ったまま I2S 送信へ流し込む。
             i2s.write_packet(&packet.data[..packet.len]).await;
         }
     };
