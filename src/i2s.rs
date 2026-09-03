@@ -8,6 +8,7 @@ pub struct I2s2Tx;
 
 impl I2s2Tx {
     pub fn new() -> Self {
+        // SPI2 を I2S2 送信に使えるようクロックと GPIO を初期化する。
         enable_clocks();
         configure_gpio_port_b_pin_af(12);
         configure_gpio_port_b_pin_af(13);
@@ -20,6 +21,7 @@ impl I2s2Tx {
         let prescaler = divider / 2;
         let odd = (divider & 0x01) != 0;
 
+        // 設定変更前に SPI/I2S を停止して分周値とフォーマットを更新する。
         pac::SPI2.ctlr1().modify(|w| w.set_spe(false));
         pac::SPI2.i2s_cfgr().modify(|w| w.set_i2se(false));
 
@@ -44,10 +46,12 @@ impl I2s2Tx {
     pub async fn write_packet(&mut self, data: &[u8]) {
         for sample_bytes in data.chunks_exact(2) {
             while !pac::SPI2.statr().read().txe() {}
+            // USB から届く little-endian PCM16 をそのまま送信レジスタへ渡す。
             let sample = u16::from_le_bytes([sample_bytes[0], sample_bytes[1]]);
             pac::SPI2.datar().write(|w| w.set_datar(sample));
         }
 
+        // 最後のサンプルがシフトアウトされるまで待ってから次のタスクへ譲る。
         while pac::SPI2.statr().read().bsy() {}
         yield_now().await;
     }
@@ -81,6 +85,7 @@ fn configure_gpio_port_b_pin_af(pin: usize) {
 
 fn calculate_i2s_divider(sample_rate_hz: u32) -> u16 {
     let base = 32 * sample_rate_hz;
+    // 16-bit stereo のビットクロックに合わせて最も近い整数分周値を選ぶ。
     let divider = ((I2S_CLOCK_HZ + (base / 2)) / base).clamp(4, 510);
     divider as u16
 }

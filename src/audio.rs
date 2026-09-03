@@ -13,6 +13,7 @@ pub const BITS_PER_SAMPLE: u8 = 16;
 pub const USB_PACKET_SIZE: usize =
     (SAMPLE_RATE_HZ as usize / 1_000) * CHANNEL_COUNT * BYTES_PER_SAMPLE;
 
+// Alternate Setting 1 の有効化状態を保持し、再生開始/停止を追跡する。
 pub static STREAM_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 const USB_CLASS_AUDIO: u8 = 0x01;
@@ -68,6 +69,7 @@ impl UsbAudioClass {
         );
 
         const AC_TOTAL_LENGTH: u16 = 46;
+        // AudioControl 側ではクロック源と入出力ターミナルだけを最小構成で公開する。
         ac_alt.descriptor(
             CS_INTERFACE,
             &[
@@ -122,6 +124,7 @@ impl UsbAudioClass {
 
         let mut as_interface = func.interface();
         let as_interface_number = as_interface.interface_number();
+        // Alt 0 は帯域未使用、Alt 1 で実際の等時 OUT エンドポイントを有効化する。
         let _ = as_interface.alt_setting(
             USB_CLASS_AUDIO,
             USB_SUBCLASS_AUDIO_STREAMING,
@@ -204,11 +207,13 @@ impl Handler for UsbAudioClass {
 
         match req.request {
             UAC2_GET_CUR => {
+                // ホストへ現在の固定サンプルレート 48 kHz を返す。
                 let bytes = SAMPLE_RATE_HZ.to_le_bytes();
                 buf[..bytes.len()].copy_from_slice(&bytes);
                 Some(InResponse::Accepted(&buf[..bytes.len()]))
             }
             UAC2_GET_RANGE => {
+                // この実装では単一レートのみ対応するため min/max を同じ値で返す。
                 let response = {
                     let mut bytes = [0u8; 14];
                     bytes[0..2].copy_from_slice(&1u16.to_le_bytes());
