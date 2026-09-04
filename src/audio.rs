@@ -2,7 +2,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use embassy_usb::control::{InResponse, OutResponse, Recipient, Request, RequestType};
 use embassy_usb::descriptor::{SynchronizationType, UsageType};
-use embassy_usb::driver::{Driver, EndpointOut};
+use embassy_usb::driver::{Driver, Endpoint, EndpointIn, EndpointOut};
 use embassy_usb::types::InterfaceNumber;
 use embassy_usb::{Builder, Handler};
 
@@ -12,6 +12,7 @@ pub const BYTES_PER_SAMPLE: usize = 2;
 pub const BITS_PER_SAMPLE: u8 = 16;
 pub const USB_PACKET_SIZE: usize =
     (SAMPLE_RATE_HZ as usize / 1_000) * CHANNEL_COUNT * BYTES_PER_SAMPLE;
+pub const FEEDBACK_PACKET: [u8; 3] = feedback_packet_10_14(SAMPLE_RATE_HZ);
 
 // Alternate Setting 1 の有効化状態を保持し、再生開始/停止を追跡する。
 pub static STREAM_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -42,6 +43,7 @@ const TERM_USB_STREAMING: u16 = 0x0101;
 const TERM_SPEAKER: u16 = 0x0301;
 const CHANNEL_CONFIG_FL_FR: u32 = 0x0000_0003;
 const PCM_FORMAT_I: u32 = 0x0000_0001;
+const FEEDBACK_REFRESH_PERIOD: u8 = 1;
 
 const UAC2_GET_CUR: u8 = 0x01;
 const UAC2_GET_RANGE: u8 = 0x02;
@@ -52,10 +54,23 @@ pub struct UsbAudioClass {
     streaming_interface: InterfaceNumber,
 }
 
+const fn feedback_value_10_14(sample_rate_hz: u32) -> u32 {
+    // Full-Speed の明示的フィードバックで使う 10.14 固定小数点へ変換する。
+    (sample_rate_hz << 14) / 1_000
+}
+
+const fn feedback_packet_10_14(sample_rate_hz: u32) -> [u8; 3] {
+    let bytes = feedback_value_10_14(sample_rate_hz).to_le_bytes();
+    [bytes[0], bytes[1], bytes[2]]
+}
+
 impl UsbAudioClass {
-    pub fn new<'d, D: Driver<'d>>(builder: &mut Builder<'d, D>) -> (Self, D::EndpointOut)
+    pub fn new<'d, D: Driver<'d>>(
+        builder: &mut Builder<'d, D>,
+    ) -> (Self, D::EndpointOut, D::EndpointIn)
     where
         D::EndpointOut: EndpointOut,
+        D::EndpointIn: EndpointIn,
     {
         let mut func = builder.function(USB_CLASS_AUDIO, 0x00, USB_PROTOCOL_IP_02_00);
 
@@ -167,15 +182,29 @@ impl UsbAudioClass {
             ],
         );
 
-        let stream_endpoint = as_alt.endpoint_isochronous_out(
+        let stream_endpoint = as_alt.alloc_endpoint_out(
+            embassy_usb_driver::EndpointType::Isochronous,
             None,
             USB_PACKET_SIZE as u16,
             1,
+        );
+        let feedback_endpoint =
+            as_alt.alloc_endpoint_in(embassy_usb_driver::EndpointType::Isochronous, None, 4, 1);
+        // ストリーム OUT 側へ同期先のフィードバックエンドポイント番号を関連付ける。
+        as_alt.endpoint_descriptor(
+            stream_endpoint.info(),
             SynchronizationType::Asynchronous,
             UsageType::DataEndpoint,
-            &[],
+            &[0x00, feedback_endpoint.info().addr.into()],
         );
         as_alt.descriptor(CS_ENDPOINT, &[EP_GENERAL, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        // フィードバック値自体は 10.14 の 3 byte だが、最大長は余裕を見て 4 byte にする。
+        as_alt.endpoint_descriptor(
+            feedback_endpoint.info(),
+            SynchronizationType::NoSynchronization,
+            UsageType::FeedbackEndpoint,
+            &[FEEDBACK_REFRESH_PERIOD, 0x00],
+        );
 
         (
             Self {
@@ -183,6 +212,7 @@ impl UsbAudioClass {
                 streaming_interface: as_interface_number,
             },
             stream_endpoint,
+            feedback_endpoint,
         )
     }
 }
