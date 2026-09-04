@@ -4,6 +4,8 @@
 use ch32_hal::otg_fs::{self, Driver};
 use ch32_hal::usb::EndpointDataBuffer512;
 use ch32_hal::{self as hal, bind_interrupts, peripherals, Config};
+use defmt::info;
+use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_futures::join::{join, join5};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -142,6 +144,7 @@ async fn main(_spawner: Spawner) -> ! {
         ..Default::default()
     };
     let p = hal::init(config);
+    info!("boot");
 
     // SPI2/I2S2 に割り当てるピンを確保して他用途への再利用を防ぐ。
     let _spi2 = p.SPI2;
@@ -197,6 +200,11 @@ async fn main(_spawner: Spawner) -> ! {
         audio::current_sample_rate_hz(),
         audio::current_bits_per_sample(),
     );
+    info!(
+        "i2s init rate={}Hz bits={}",
+        audio::current_sample_rate_hz(),
+        audio::current_bits_per_sample()
+    );
     let initial_packet_words = audio::current_i2s_packet_words();
     i2s.prime(&silence[..initial_packet_words]);
     i2s.start();
@@ -208,6 +216,7 @@ async fn main(_spawner: Spawner) -> ! {
 
         loop {
             stream_endpoint_16.wait_enabled().await;
+            info!("stream16 enabled");
             {
                 // 新しいストリーム開始時は前回の残りを捨てて先頭から再生し直す。
                 let mut fifo = AUDIO_FIFO.lock().await;
@@ -227,6 +236,7 @@ async fn main(_spawner: Spawner) -> ! {
                         fifo.push_slice(&words[..word_count]);
                     }
                     Err(EndpointError::Disabled) => {
+                        info!("stream16 disabled");
                         let mut fifo = AUDIO_FIFO.lock().await;
                         fifo.clear();
                         break;
@@ -242,6 +252,7 @@ async fn main(_spawner: Spawner) -> ! {
 
         loop {
             stream_endpoint_24.wait_enabled().await;
+            info!("stream24 enabled");
             {
                 let mut fifo = AUDIO_FIFO.lock().await;
                 fifo.clear();
@@ -259,6 +270,7 @@ async fn main(_spawner: Spawner) -> ! {
                         fifo.push_slice(&words[..word_count]);
                     }
                     Err(EndpointError::Disabled) => {
+                        info!("stream24 disabled");
                         let mut fifo = AUDIO_FIFO.lock().await;
                         fifo.clear();
                         break;
@@ -277,6 +289,12 @@ async fn main(_spawner: Spawner) -> ! {
             if next_config_version != config_version {
                 config_version = next_config_version;
                 let packet_words = audio::current_i2s_packet_words();
+                info!(
+                    "stream config changed rate={}Hz bits={} i2s_words={}",
+                    audio::current_sample_rate_hz(),
+                    audio::current_bits_per_sample(),
+                    packet_words
+                );
                 {
                     let mut fifo = AUDIO_FIFO.lock().await;
                     fifo.clear();

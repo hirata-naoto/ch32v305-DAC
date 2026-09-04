@@ -2,4 +2,4 @@
 target = "riscv32imac-unknown-none-elf"
 
 [target.riscv32imac-unknown-none-elf]
-runner = "wlink flash --enable-sdi-print --watch-serial"
+runner = "probe-rs run --chip CH32V305RBT6"
