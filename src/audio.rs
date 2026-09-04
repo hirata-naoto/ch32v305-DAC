@@ -171,7 +171,7 @@ impl UsbAudioClass {
             None,
             USB_PACKET_SIZE as u16,
             1,
-            SynchronizationType::Adaptive,
+            SynchronizationType::Asynchronous,
             UsageType::DataEndpoint,
             &[],
         );
