@@ -55,7 +55,10 @@ const CLOCK_VALIDITY_CONTROL_SELECTOR: u8 = 0x02;
 const CLOCK_SOURCE_ATTRIBUTES_INTERNAL_PROGRAMMABLE: u8 = 0x03;
 const CLOCK_SOURCE_CONTROLS_HOST_PROGRAMMABLE_FREQUENCY_RW_VALIDITY_RO: u8 = 0x07;
 const CLOCK_SOURCE_ASSOCIATION_TERMINAL_ID: u8 = 0x00;
+const CLOCK_CONTROL_MASTER_CHANNEL: u8 = 0x00;
 const CLOCK_VALIDITY_TRUE: u8 = 1;
+const CLOCK_FREQUENCY_BYTES: usize = core::mem::size_of::<u32>();
+const CLOCK_VALIDITY_BYTES: usize = core::mem::size_of::<u8>();
 const SUPPORTED_SAMPLE_RATES_HZ: [u32; 4] = [44_100, 48_000, 88_200, 96_000];
 
 pub struct UsbAudioClass {
@@ -382,11 +385,14 @@ impl Handler for UsbAudioClass {
             return Some(OutResponse::Rejected);
         }
 
-        if ((req.value >> 8) as u8) != CLOCK_FREQUENCY_CONTROL_SELECTOR || buf.len() < 4 {
+        if (req.value as u8) != CLOCK_CONTROL_MASTER_CHANNEL
+            || ((req.value >> 8) as u8) != CLOCK_FREQUENCY_CONTROL_SELECTOR
+            || buf.len() < CLOCK_FREQUENCY_BYTES
+        {
             return Some(OutResponse::Rejected);
         }
 
-        let sample_rate_hz = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        let sample_rate_hz = u32::from_le_bytes(buf[..CLOCK_FREQUENCY_BYTES].try_into().unwrap());
         let bits_per_sample = current_bits_per_sample();
         if !supports_stream_format(bits_per_sample, sample_rate_hz) {
             return Some(OutResponse::Rejected);
@@ -411,9 +417,17 @@ impl Handler for UsbAudioClass {
             return None;
         }
 
-        match (((req.value >> 8) as u8), req.request) {
+        let control_selector = (req.value >> 8) as u8;
+        if (req.value as u8) != CLOCK_CONTROL_MASTER_CHANNEL {
+            return Some(InResponse::Rejected);
+        }
+
+        match (control_selector, req.request) {
             (CLOCK_FREQUENCY_CONTROL_SELECTOR, UAC2_CUR) => {
                 // ホストへ現在選択中のサンプルレートを返す。
+                if buf.len() < CLOCK_FREQUENCY_BYTES {
+                    return Some(InResponse::Rejected);
+                }
                 let bytes = current_sample_rate_hz().to_le_bytes();
                 buf[..bytes.len()].copy_from_slice(&bytes);
                 Some(InResponse::Accepted(&buf[..bytes.len()]))
@@ -422,6 +436,9 @@ impl Handler for UsbAudioClass {
                 // 離散レート列として 44.1/48/88.2/96 kHz を返し、
                 // 各 alternate setting の wMaxPacketSize で実際の組み合わせを絞り込む。
                 let mut response = [0u8; 2 + SUPPORTED_SAMPLE_RATES_HZ.len() * 12];
+                if buf.len() < response.len() {
+                    return Some(InResponse::Rejected);
+                }
                 response[0..2]
                     .copy_from_slice(&(SUPPORTED_SAMPLE_RATES_HZ.len() as u16).to_le_bytes());
                 for (index, sample_rate_hz) in SUPPORTED_SAMPLE_RATES_HZ.iter().enumerate() {
@@ -434,8 +451,11 @@ impl Handler for UsbAudioClass {
                 Some(InResponse::Accepted(&buf[..response.len()]))
             }
             (CLOCK_VALIDITY_CONTROL_SELECTOR, UAC2_CUR) => {
+                if buf.len() < CLOCK_VALIDITY_BYTES {
+                    return Some(InResponse::Rejected);
+                }
                 buf[0] = CLOCK_VALIDITY_TRUE;
-                Some(InResponse::Accepted(&buf[..1]))
+                Some(InResponse::Accepted(&buf[..CLOCK_VALIDITY_BYTES]))
             }
             _ => None,
         }
