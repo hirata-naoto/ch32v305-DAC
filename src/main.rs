@@ -2,8 +2,8 @@
 #![no_main]
 
 use audio::USB_PACKET_SIZE;
-use ch32_hal::usbhs::{self, Driver};
 use ch32_hal::usb::EndpointDataBuffer512;
+use ch32_hal::usbhs::{self, Driver};
 use ch32_hal::{self as hal, bind_interrupts, peripherals, Config};
 use embassy_executor::Spawner;
 use embassy_futures::join::join4;
