@@ -6,13 +6,14 @@ use embassy_usb::driver::{Driver, Endpoint, EndpointIn, EndpointOut};
 use embassy_usb::types::InterfaceNumber;
 use embassy_usb::{Builder, Handler};
 
-pub const SAMPLE_RATE_HZ: u32 = 48_000;
+pub const SAMPLE_RATE_HZ: u32 = 192_000;
 pub const CHANNEL_COUNT: usize = 2;
-pub const BYTES_PER_SAMPLE: usize = 2;
-pub const BITS_PER_SAMPLE: u8 = 16;
+pub const BYTES_PER_SAMPLE: usize = 4;
+pub const BITS_PER_SAMPLE: u8 = 32;
+pub const USB_SERVICE_INTERVAL_HZ: usize = 8_000;
 pub const USB_PACKET_SIZE: usize =
-    (SAMPLE_RATE_HZ as usize / 1_000) * CHANNEL_COUNT * BYTES_PER_SAMPLE;
-pub const FEEDBACK_PACKET: [u8; 3] = feedback_packet_10_14(SAMPLE_RATE_HZ);
+    (SAMPLE_RATE_HZ as usize / USB_SERVICE_INTERVAL_HZ) * CHANNEL_COUNT * BYTES_PER_SAMPLE;
+pub const FEEDBACK_PACKET: [u8; 4] = feedback_packet_16_16(SAMPLE_RATE_HZ);
 
 // Alternate Setting 1 の有効化状態を保持し、再生開始/停止を追跡する。
 pub static STREAM_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -54,14 +55,13 @@ pub struct UsbAudioClass {
     streaming_interface: InterfaceNumber,
 }
 
-const fn feedback_value_10_14(sample_rate_hz: u32) -> u32 {
-    // Full-Speed の明示的フィードバックで使う 10.14 固定小数点へ変換する。
-    (sample_rate_hz << 14) / 1_000
+const fn feedback_value_16_16(sample_rate_hz: u32) -> u32 {
+    // High-Speed の明示的フィードバックなので 16.16 固定小数点で 125 us あたりのサンプル数へ変換する。
+    (sample_rate_hz << 16) / (USB_SERVICE_INTERVAL_HZ as u32)
 }
 
-const fn feedback_packet_10_14(sample_rate_hz: u32) -> [u8; 3] {
-    let bytes = feedback_value_10_14(sample_rate_hz).to_le_bytes();
-    [bytes[0], bytes[1], bytes[2]]
+const fn feedback_packet_16_16(sample_rate_hz: u32) -> [u8; 4] {
+    feedback_value_16_16(sample_rate_hz).to_le_bytes()
 }
 
 impl UsbAudioClass {
@@ -198,7 +198,6 @@ impl UsbAudioClass {
             &[0x00, feedback_endpoint.info().addr.into()],
         );
         as_alt.descriptor(CS_ENDPOINT, &[EP_GENERAL, 0x00, 0x00, 0x00, 0x00, 0x00]);
-        // フィードバック値自体は 10.14 の 3 byte だが、最大長は余裕を見て 4 byte にする。
         as_alt.endpoint_descriptor(
             feedback_endpoint.info(),
             SynchronizationType::NoSynchronization,
@@ -237,7 +236,7 @@ impl Handler for UsbAudioClass {
 
         match req.request {
             UAC2_GET_CUR => {
-                // ホストへ現在の固定サンプルレート 48 kHz を返す。
+                // ホストへ現在の固定サンプルレート 192 kHz を返す。
                 let bytes = SAMPLE_RATE_HZ.to_le_bytes();
                 buf[..bytes.len()].copy_from_slice(&bytes);
                 Some(InResponse::Accepted(&buf[..bytes.len()]))
