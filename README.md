@@ -8,7 +8,7 @@ CH32V305 で USB Audio Class 2.0 の再生ストリームを受け取り、USBHS
 - 同期方式: 非同期 OUT + 明示的フィードバックエンドポイント
 - Audio format: PCM, 32-bit, stereo, 192 kHz 固定
 - I2S: SPI2 を I2S master transmit として使用
-- バッファリング: USB と I2S の間に約 32 ms 分のソフトウェア FIFO を配置
+- バッファリング: USB と I2S の間に約 8 ms 分のソフトウェア FIFO を配置
 - 送信方式: SPI2 TX は DMA1_CH5 の circular DMA で連続出力
 - 想定ピン:
   - USBHS DM: `PB6`

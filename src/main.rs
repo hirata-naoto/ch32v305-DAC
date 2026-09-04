@@ -23,8 +23,8 @@ bind_interrupts!(struct Irq {
 });
 
 const USB_PACKET_WORDS: usize = USB_PACKET_SIZE / 2;
-const AUDIO_FIFO_CAPACITY_WORDS: usize = USB_PACKET_WORDS * 256;
-const I2S_DMA_BUFFER_WORDS: usize = USB_PACKET_WORDS * 32;
+const AUDIO_FIFO_CAPACITY_WORDS: usize = USB_PACKET_WORDS * 64;
+const I2S_DMA_BUFFER_WORDS: usize = USB_PACKET_WORDS * 16;
 
 static AUDIO_FIFO: Mutex<CriticalSectionRawMutex, AudioSampleFifo<AUDIO_FIFO_CAPACITY_WORDS>> =
     Mutex::new(AudioSampleFifo::new());
