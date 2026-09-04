@@ -65,7 +65,9 @@ const fn feedback_packet_10_14(sample_rate_hz: u32) -> [u8; 3] {
 }
 
 impl UsbAudioClass {
-    pub fn new<'d, D: Driver<'d>>(builder: &mut Builder<'d, D>) -> (Self, D::EndpointOut, D::EndpointIn)
+    pub fn new<'d, D: Driver<'d>>(
+        builder: &mut Builder<'d, D>,
+    ) -> (Self, D::EndpointOut, D::EndpointIn)
     where
         D::EndpointOut: EndpointOut,
         D::EndpointIn: EndpointIn,
@@ -186,12 +188,8 @@ impl UsbAudioClass {
             USB_PACKET_SIZE as u16,
             1,
         );
-        let feedback_endpoint = as_alt.alloc_endpoint_in(
-            embassy_usb_driver::EndpointType::Isochronous,
-            None,
-            4,
-            1,
-        );
+        let feedback_endpoint =
+            as_alt.alloc_endpoint_in(embassy_usb_driver::EndpointType::Isochronous, None, 4, 1);
         // ストリーム OUT 側へ同期先のフィードバックエンドポイント番号を関連付ける。
         as_alt.endpoint_descriptor(
             stream_endpoint.info(),
