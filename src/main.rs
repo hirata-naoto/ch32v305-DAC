@@ -6,10 +6,10 @@ use ch32_hal::otg_fs::{self, Driver};
 use ch32_hal::usb::EndpointDataBuffer512;
 use ch32_hal::{self as hal, bind_interrupts, peripherals, Config};
 use embassy_executor::Spawner;
-use embassy_futures::join::join3;
+use embassy_futures::join::join4;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
-use embassy_usb::driver::{Endpoint, EndpointError, EndpointOut};
+use embassy_usb::driver::{Endpoint, EndpointError, EndpointIn, EndpointOut};
 use embassy_usb::Builder;
 use panic_halt as _;
 use static_cell::StaticCell;
@@ -125,7 +125,7 @@ async fn main(_spawner: Spawner) -> ! {
     let _i2s_sd = p.PB15;
     let dma_buffer = I2S_DMA_BUFFER.init([0; I2S_DMA_BUFFER_WORDS]);
 
-    let mut endpoint_buffers: [EndpointDataBuffer512; 1] =
+    let mut endpoint_buffers: [EndpointDataBuffer512; 2] =
         core::array::from_fn(|_| EndpointDataBuffer512::default());
     let driver = Driver::new(p.OTG_FS, p.PA12, p.PA11, &mut endpoint_buffers);
 
@@ -155,7 +155,8 @@ async fn main(_spawner: Spawner) -> ! {
         &mut control_buf,
     );
 
-    let (audio_handler, mut stream_endpoint) = audio::UsbAudioClass::new(&mut builder);
+    let (audio_handler, mut stream_endpoint, mut feedback_endpoint) =
+        audio::UsbAudioClass::new(&mut builder);
     let audio_handler = AUDIO_HANDLER.init(audio_handler);
     builder.handler(audio_handler);
 
@@ -215,7 +216,21 @@ async fn main(_spawner: Spawner) -> ! {
             i2s.write_words(&chunk).await;
         }
     };
+    let feedback_fut = async {
+        loop {
+            feedback_endpoint.wait_enabled().await;
 
-    join3(usb_fut, receive_fut, playback_fut).await;
+            loop {
+                // 48 kHz 固定動作なので、ホストへは毎フレーム同じ 10.14 値を返す。
+                match feedback_endpoint.write(&audio::FEEDBACK_PACKET).await {
+                    Ok(()) => {}
+                    Err(EndpointError::Disabled) => break,
+                    Err(EndpointError::BufferOverflow) => {}
+                }
+            }
+        }
+    };
+
+    join4(usb_fut, receive_fut, playback_fut, feedback_fut).await;
     loop {}
 }

@@ -5,6 +5,7 @@ CH32V305 で USB Audio Class 2.0 の再生ストリームを受け取り、I2S �
 ## 構成
 
 - USB: OTG_FS, UAC2 speaker sink
+- 同期方式: 非同期 OUT + 明示的フィードバックエンドポイント
 - Audio format: PCM, 16-bit, stereo, 48 kHz 固定
 - I2S: SPI2 を I2S master transmit として使用
 - バッファリング: USB と I2S の間に 32 ms 分のソフトウェア FIFO を配置
@@ -31,6 +32,7 @@ cargo build --release --no-default-features --features chip-ch32v305gbu6
 ## 注意
 
 - `ch32-hal` には UAC2 の完成済みクラスがないため、このサンプルは `embassy-usb` のカスタム記述子で最小限の UAC2 sink を実装しています。
+- ホスト側の転送レート追従用に、48 kHz 固定の明示的フィードバックエンドポイントを返します。
 - サンプルレートは 48 kHz 固定です。
 - USB から届いた PCM は一度サンプル FIFO へ貯め、I2S 側は DMA リングバッファへ先回りで供給しています。
 - FIFO が不足した区間は無音で埋め、FIFO が溢れそうなときは古いサンプルを捨てて遅延の増大を抑えています。
