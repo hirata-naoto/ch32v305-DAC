@@ -2,7 +2,7 @@
 #![no_main]
 
 use audio::USB_PACKET_SIZE;
-use ch32_hal::otg_fs::{self, Driver};
+use ch32_hal::usbhs::{self, Driver};
 use ch32_hal::usb::EndpointDataBuffer512;
 use ch32_hal::{self as hal, bind_interrupts, peripherals, Config};
 use embassy_executor::Spawner;
@@ -18,12 +18,13 @@ mod audio;
 mod i2s;
 
 bind_interrupts!(struct Irq {
-    OTG_FS => otg_fs::InterruptHandler<peripherals::OTG_FS>;
+    USBHS => usbhs::InterruptHandler<peripherals::USBHS>;
+    USBHS_WKUP => usbhs::WakeupInterruptHandler<peripherals::USBHS>;
 });
 
 const USB_PACKET_WORDS: usize = USB_PACKET_SIZE / 2;
-const AUDIO_FIFO_CAPACITY_WORDS: usize = USB_PACKET_WORDS * 32;
-const I2S_DMA_BUFFER_WORDS: usize = USB_PACKET_WORDS * 4;
+const AUDIO_FIFO_CAPACITY_WORDS: usize = USB_PACKET_WORDS * 256;
+const I2S_DMA_BUFFER_WORDS: usize = USB_PACKET_WORDS * 32;
 
 static AUDIO_FIFO: Mutex<CriticalSectionRawMutex, AudioSampleFifo<AUDIO_FIFO_CAPACITY_WORDS>> =
     Mutex::new(AudioSampleFifo::new());
@@ -102,7 +103,7 @@ impl<const N: usize> AudioSampleFifo<N> {
 fn bytes_to_words(bytes: &[u8], out: &mut [u16]) -> usize {
     let mut count = 0;
     for sample_bytes in bytes.chunks_exact(2).take(out.len()) {
-        // USB から届く little-endian PCM16 を DMA 用の 16-bit サンプル列へ詰め替える。
+        // USB から届く little-endian PCM32 を、I2S の 16-bit データレジスタへ流し込む半語列へ詰め替える。
         out[count] = u16::from_le_bytes([sample_bytes[0], sample_bytes[1]]);
         count += 1;
     }
@@ -123,15 +124,18 @@ async fn main(_spawner: Spawner) -> ! {
     let _i2s_ws = p.PB12;
     let _i2s_ck = p.PB13;
     let _i2s_sd = p.PB15;
+    // USBHS では PB7/PB6 が DP/DM になるため、ここで予約しておく。
+    let _usbhs_dp = p.PB7;
+    let _usbhs_dm = p.PB6;
     let dma_buffer = I2S_DMA_BUFFER.init([0; I2S_DMA_BUFFER_WORDS]);
 
     let mut endpoint_buffers: [EndpointDataBuffer512; 2] =
         core::array::from_fn(|_| EndpointDataBuffer512::default());
-    let driver = Driver::new(p.OTG_FS, p.PA12, p.PA11, &mut endpoint_buffers);
+    let driver = Driver::new(p.USBHS, Irq, _usbhs_dp, _usbhs_dm, &mut endpoint_buffers);
 
     let mut usb_config = embassy_usb::Config::new(0x1209, 0x3050);
     usb_config.manufacturer = Some("hirata-naoto");
-    usb_config.product = Some("CH32V305 USB Audio to I2S");
+    usb_config.product = Some("CH32V305 USBHS Audio to I2S");
     usb_config.serial_number = Some("0001");
     usb_config.device_class = 0x00;
     usb_config.device_sub_class = 0x00;
@@ -184,7 +188,7 @@ async fn main(_spawner: Spawner) -> ! {
                     Ok(received) => {
                         let word_count = bytes_to_words(&packet[..received], &mut words);
                         let mut fifo = AUDIO_FIFO.lock().await;
-                        // USB 等時転送で受けた 1 ms 分の PCM を、I2S 側とは独立した FIFO へ積む。
+                        // USBHS の等時転送で受けた 125 us 分の PCM を、I2S 側とは独立した FIFO へ積む。
                         fifo.push_slice(&words[..word_count]);
                     }
                     Err(EndpointError::Disabled) => {
@@ -221,7 +225,7 @@ async fn main(_spawner: Spawner) -> ! {
             feedback_endpoint.wait_enabled().await;
 
             loop {
-                // 48 kHz 固定動作なので、ホストへは毎フレーム同じ 10.14 値を返す。
+                // 192 kHz 固定動作なので、ホストへは毎マイクロフレーム同じ 16.16 値を返す。
                 match feedback_endpoint.write(&audio::FEEDBACK_PACKET).await {
                     Ok(()) => {}
                     Err(EndpointError::Disabled) => break,

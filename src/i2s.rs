@@ -2,6 +2,7 @@ use ch32_hal::dma::{Channel, Priority, TransferOptions, WritableRingBuffer};
 use ch32_hal::{pac, Peri};
 
 const I2S_CLOCK_HZ: u32 = 144_000_000;
+const I2S_FRAME_BITS: u32 = 64;
 
 pub struct I2s2Tx<'d> {
     dma_ring: WritableRingBuffer<'d, u16>,
@@ -20,7 +21,7 @@ impl<'d> I2s2Tx<'d> {
         dma_options.priority = Priority::VeryHigh;
 
         let dma_ring = unsafe {
-            // DMA は SPI2 のデータレジスタへ 16-bit PCM を順番に流し込む。
+            // SPI2 のデータレジスタは 16bit 幅なので、32bit PCM も半語 2 個ずつ順番に流し込む。
             WritableRingBuffer::new(
                 tx_dma,
                 (),
@@ -53,8 +54,9 @@ impl<'d> I2s2Tx<'d> {
         });
 
         pac::SPI2.i2s_cfgr().write(|w| {
-            w.set_chlen(pac::spi::vals::Chlen::BIT16);
-            w.set_datlen(pac::spi::vals::I2sdatlen::BIT16);
+            // 32-bit stereo を 1 チャンネル 32bit 幅で送るため、I2S フレーム長と有効データ長を両方 32bit にする。
+            w.set_chlen(pac::spi::vals::Chlen::BIT32);
+            w.set_datlen(pac::spi::vals::I2sdatlen::BIT32);
             w.set_ckpol(false);
             w.set_i2sstd(pac::spi::vals::I2sstd::PHILIPS);
             w.set_pcmsync(false);
@@ -121,8 +123,8 @@ fn configure_gpio_port_b_pin_af(pin: usize) {
 }
 
 fn calculate_i2s_divider(sample_rate_hz: u32) -> u16 {
-    let base = 32 * sample_rate_hz;
-    // 16-bit stereo のビットクロックに合わせて最も近い整数分周値を選ぶ。
+    let base = I2S_FRAME_BITS * sample_rate_hz;
+    // 32-bit stereo のビットクロックに合わせて最も近い整数分周値を選ぶ。
     let divider = ((I2S_CLOCK_HZ + (base / 2)) / base).clamp(4, 510);
     divider as u16
 }
