@@ -1,4 +1,4 @@
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 
 use embassy_usb::control::{InResponse, OutResponse, Recipient, Request, RequestType};
 use embassy_usb::descriptor::{SynchronizationType, UsageType};
@@ -8,14 +8,17 @@ use embassy_usb::{Builder, Handler};
 
 pub const SAMPLE_RATE_HZ: u32 = 48_000;
 pub const CHANNEL_COUNT: usize = 2;
-pub const BYTES_PER_SAMPLE: usize = 2;
-pub const BITS_PER_SAMPLE: u8 = 16;
-pub const USB_PACKET_SIZE: usize =
-    (SAMPLE_RATE_HZ as usize / 1_000) * CHANNEL_COUNT * BYTES_PER_SAMPLE;
-pub const FEEDBACK_PACKET: [u8; 3] = feedback_packet_10_14(SAMPLE_RATE_HZ);
+pub const BITS_PER_SAMPLE_16: u8 = 16;
+pub const BITS_PER_SAMPLE_24: u8 = 24;
+pub const USB_PACKET_SIZE_16: usize = usb_packet_size(BITS_PER_SAMPLE_16, 96_000);
+pub const USB_PACKET_SIZE_24: usize = usb_packet_size(BITS_PER_SAMPLE_24, 48_000);
+pub const MAX_I2S_PACKET_WORDS: usize = i2s_words_per_usb_packet(BITS_PER_SAMPLE_16, 96_000);
 
-// Alternate Setting 1 の有効化状態を保持し、再生開始/停止を追跡する。
+// Alternate Setting 1 / 2 の有効化状態を保持し、再生開始/停止を追跡する。
 pub static STREAM_ACTIVE: AtomicBool = AtomicBool::new(false);
+static CURRENT_SAMPLE_RATE_HZ: AtomicU32 = AtomicU32::new(SAMPLE_RATE_HZ);
+static CURRENT_BITS_PER_SAMPLE: AtomicU8 = AtomicU8::new(BITS_PER_SAMPLE_16);
+static STREAM_CONFIG_VERSION: AtomicU32 = AtomicU32::new(0);
 
 const USB_CLASS_AUDIO: u8 = 0x01;
 const USB_SUBCLASS_AUDIO_CONTROL: u8 = 0x01;
@@ -48,10 +51,31 @@ const FEEDBACK_REFRESH_PERIOD: u8 = 1;
 const UAC2_GET_CUR: u8 = 0x01;
 const UAC2_GET_RANGE: u8 = 0x02;
 const SAM_FREQ_CS: u8 = 0x01;
+const SUPPORTED_SAMPLE_RATES_HZ: [u32; 4] = [44_100, 48_000, 88_200, 96_000];
 
 pub struct UsbAudioClass {
     ac_interface: InterfaceNumber,
     streaming_interface: InterfaceNumber,
+}
+
+const fn bytes_per_sample(bits_per_sample: u8) -> usize {
+    (bits_per_sample as usize).div_ceil(8)
+}
+
+const fn i2s_words_per_sample(bits_per_sample: u8) -> usize {
+    match bits_per_sample {
+        BITS_PER_SAMPLE_16 => 1,
+        BITS_PER_SAMPLE_24 => 2,
+        _ => 1,
+    }
+}
+
+const fn usb_packet_size(bits_per_sample: u8, sample_rate_hz: u32) -> usize {
+    sample_rate_hz.div_ceil(1_000) as usize * CHANNEL_COUNT * bytes_per_sample(bits_per_sample)
+}
+
+pub const fn i2s_words_per_usb_packet(bits_per_sample: u8, sample_rate_hz: u32) -> usize {
+    sample_rate_hz.div_ceil(1_000) as usize * CHANNEL_COUNT * i2s_words_per_sample(bits_per_sample)
 }
 
 const fn feedback_value_10_14(sample_rate_hz: u32) -> u32 {
@@ -64,10 +88,64 @@ const fn feedback_packet_10_14(sample_rate_hz: u32) -> [u8; 3] {
     [bytes[0], bytes[1], bytes[2]]
 }
 
+fn supports_sample_rate(sample_rate_hz: u32) -> bool {
+    SUPPORTED_SAMPLE_RATES_HZ.contains(&sample_rate_hz)
+}
+
+pub fn supports_stream_format(bits_per_sample: u8, sample_rate_hz: u32) -> bool {
+    match bits_per_sample {
+        BITS_PER_SAMPLE_16 => supports_sample_rate(sample_rate_hz),
+        // USB FS + 現在の ch32-hal では 512 byte を超える等時パケットを扱えないため、
+        // 24-bit は 48 kHz までに制限する。
+        BITS_PER_SAMPLE_24 => matches!(sample_rate_hz, 44_100 | 48_000),
+        _ => false,
+    }
+}
+
+pub fn current_sample_rate_hz() -> u32 {
+    CURRENT_SAMPLE_RATE_HZ.load(Ordering::Relaxed)
+}
+
+pub fn current_bits_per_sample() -> u8 {
+    CURRENT_BITS_PER_SAMPLE.load(Ordering::Relaxed)
+}
+
+pub fn current_feedback_packet() -> [u8; 3] {
+    feedback_packet_10_14(current_sample_rate_hz())
+}
+
+pub fn current_i2s_packet_words() -> usize {
+    i2s_words_per_usb_packet(current_bits_per_sample(), current_sample_rate_hz())
+}
+
+pub fn stream_config_version() -> u32 {
+    STREAM_CONFIG_VERSION.load(Ordering::Relaxed)
+}
+
+fn update_sample_rate(sample_rate_hz: u32) -> bool {
+    let previous = CURRENT_SAMPLE_RATE_HZ.swap(sample_rate_hz, Ordering::Relaxed);
+    previous != sample_rate_hz
+}
+
+fn update_stream_format(bits_per_sample: u8) -> bool {
+    let previous = CURRENT_BITS_PER_SAMPLE.swap(bits_per_sample, Ordering::Relaxed);
+    previous != bits_per_sample
+}
+
+fn note_stream_config_change() {
+    STREAM_CONFIG_VERSION.fetch_add(1, Ordering::Relaxed);
+}
+
 impl UsbAudioClass {
     pub fn new<'d, D: Driver<'d>>(
         builder: &mut Builder<'d, D>,
-    ) -> (Self, D::EndpointOut, D::EndpointIn)
+    ) -> (
+        Self,
+        D::EndpointOut,
+        D::EndpointIn,
+        D::EndpointOut,
+        D::EndpointIn,
+    )
     where
         D::EndpointOut: EndpointOut,
         D::EndpointIn: EndpointIn,
@@ -147,13 +225,14 @@ impl UsbAudioClass {
             None,
         );
 
-        let mut as_alt = as_interface.alt_setting(
+        let mut as_alt_16 = as_interface.alt_setting(
             USB_CLASS_AUDIO,
             USB_SUBCLASS_AUDIO_STREAMING,
             USB_PROTOCOL_IP_02_00,
             None,
         );
-        as_alt.descriptor(
+        // Alt 1 は 16-bit 用。96 kHz までを 512 byte 未満の FS パケットで扱える。
+        as_alt_16.descriptor(
             CS_INTERFACE,
             &[
                 AS_GENERAL,
@@ -172,35 +251,93 @@ impl UsbAudioClass {
                 0x00,
             ],
         );
-        as_alt.descriptor(
+        as_alt_16.descriptor(
             CS_INTERFACE,
             &[
                 AS_FORMAT_TYPE,
                 0x01,
-                BYTES_PER_SAMPLE as u8,
-                BITS_PER_SAMPLE,
+                bytes_per_sample(BITS_PER_SAMPLE_16) as u8,
+                BITS_PER_SAMPLE_16,
             ],
         );
 
-        let stream_endpoint = as_alt.alloc_endpoint_out(
+        let stream_endpoint_16 = as_alt_16.alloc_endpoint_out(
             embassy_usb_driver::EndpointType::Isochronous,
             None,
-            USB_PACKET_SIZE as u16,
+            USB_PACKET_SIZE_16 as u16,
             1,
         );
-        let feedback_endpoint =
-            as_alt.alloc_endpoint_in(embassy_usb_driver::EndpointType::Isochronous, None, 4, 1);
+        let feedback_endpoint_16 =
+            as_alt_16.alloc_endpoint_in(embassy_usb_driver::EndpointType::Isochronous, None, 4, 1);
         // ストリーム OUT 側へ同期先のフィードバックエンドポイント番号を関連付ける。
-        as_alt.endpoint_descriptor(
-            stream_endpoint.info(),
+        as_alt_16.endpoint_descriptor(
+            stream_endpoint_16.info(),
             SynchronizationType::Asynchronous,
             UsageType::DataEndpoint,
-            &[0x00, feedback_endpoint.info().addr.into()],
+            &[0x00, feedback_endpoint_16.info().addr.into()],
         );
-        as_alt.descriptor(CS_ENDPOINT, &[EP_GENERAL, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        as_alt_16.descriptor(CS_ENDPOINT, &[EP_GENERAL, 0x00, 0x00, 0x00, 0x00, 0x00]);
         // フィードバック値自体は 10.14 の 3 byte だが、最大長は余裕を見て 4 byte にする。
-        as_alt.endpoint_descriptor(
-            feedback_endpoint.info(),
+        as_alt_16.endpoint_descriptor(
+            feedback_endpoint_16.info(),
+            SynchronizationType::NoSynchronization,
+            UsageType::FeedbackEndpoint,
+            &[FEEDBACK_REFRESH_PERIOD, 0x00],
+        );
+
+        let mut as_alt_24 = as_interface.alt_setting(
+            USB_CLASS_AUDIO,
+            USB_SUBCLASS_AUDIO_STREAMING,
+            USB_PROTOCOL_IP_02_00,
+            None,
+        );
+        // Alt 2 は 24-bit packed PCM 用。FS と HAL の 512 byte 制約上、48 kHz までに絞る。
+        as_alt_24.descriptor(
+            CS_INTERFACE,
+            &[
+                AS_GENERAL,
+                INPUT_TERM_ID,
+                0x00,
+                0x00,
+                (PCM_FORMAT_I & 0xff) as u8,
+                ((PCM_FORMAT_I >> 8) & 0xff) as u8,
+                ((PCM_FORMAT_I >> 16) & 0xff) as u8,
+                ((PCM_FORMAT_I >> 24) & 0xff) as u8,
+                CHANNEL_COUNT as u8,
+                (CHANNEL_CONFIG_FL_FR & 0xff) as u8,
+                ((CHANNEL_CONFIG_FL_FR >> 8) & 0xff) as u8,
+                ((CHANNEL_CONFIG_FL_FR >> 16) & 0xff) as u8,
+                ((CHANNEL_CONFIG_FL_FR >> 24) & 0xff) as u8,
+                0x00,
+            ],
+        );
+        as_alt_24.descriptor(
+            CS_INTERFACE,
+            &[
+                AS_FORMAT_TYPE,
+                0x01,
+                bytes_per_sample(BITS_PER_SAMPLE_24) as u8,
+                BITS_PER_SAMPLE_24,
+            ],
+        );
+
+        let stream_endpoint_24 = as_alt_24.alloc_endpoint_out(
+            embassy_usb_driver::EndpointType::Isochronous,
+            None,
+            USB_PACKET_SIZE_24 as u16,
+            1,
+        );
+        let feedback_endpoint_24 =
+            as_alt_24.alloc_endpoint_in(embassy_usb_driver::EndpointType::Isochronous, None, 4, 1);
+        as_alt_24.endpoint_descriptor(
+            stream_endpoint_24.info(),
+            SynchronizationType::Asynchronous,
+            UsageType::DataEndpoint,
+            &[0x00, feedback_endpoint_24.info().addr.into()],
+        );
+        as_alt_24.descriptor(CS_ENDPOINT, &[EP_GENERAL, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        as_alt_24.endpoint_descriptor(
+            feedback_endpoint_24.info(),
             SynchronizationType::NoSynchronization,
             UsageType::FeedbackEndpoint,
             &[FEEDBACK_REFRESH_PERIOD, 0x00],
@@ -211,15 +348,42 @@ impl UsbAudioClass {
                 ac_interface: ac_interface_number,
                 streaming_interface: as_interface_number,
             },
-            stream_endpoint,
-            feedback_endpoint,
+            stream_endpoint_16,
+            feedback_endpoint_16,
+            stream_endpoint_24,
+            feedback_endpoint_24,
         )
     }
 }
 
 impl Handler for UsbAudioClass {
-    fn control_out(&mut self, _req: Request, _buf: &[u8]) -> Option<OutResponse> {
-        None
+    fn control_out(&mut self, req: Request, buf: &[u8]) -> Option<OutResponse> {
+        if req.request_type != RequestType::Class || req.recipient != Recipient::Interface {
+            return None;
+        }
+
+        if (req.index as u8) != u8::from(self.ac_interface) {
+            return None;
+        }
+
+        if ((req.index >> 8) as u8) != CLOCK_SOURCE_ID
+            || ((req.value >> 8) as u8) != SAM_FREQ_CS
+            || req.request != UAC2_GET_CUR
+            || buf.len() < 4
+        {
+            return Some(OutResponse::Rejected);
+        }
+
+        let sample_rate_hz = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        let bits_per_sample = current_bits_per_sample();
+        if !supports_stream_format(bits_per_sample, sample_rate_hz) {
+            return Some(OutResponse::Rejected);
+        }
+
+        if update_sample_rate(sample_rate_hz) {
+            note_stream_config_change();
+        }
+        Some(OutResponse::Accepted)
     }
 
     fn control_in<'a>(&'a mut self, req: Request, buf: &'a mut [u8]) -> Option<InResponse<'a>> {
@@ -237,21 +401,23 @@ impl Handler for UsbAudioClass {
 
         match req.request {
             UAC2_GET_CUR => {
-                // ホストへ現在の固定サンプルレート 48 kHz を返す。
-                let bytes = SAMPLE_RATE_HZ.to_le_bytes();
+                // ホストへ現在選択中のサンプルレートを返す。
+                let bytes = current_sample_rate_hz().to_le_bytes();
                 buf[..bytes.len()].copy_from_slice(&bytes);
                 Some(InResponse::Accepted(&buf[..bytes.len()]))
             }
             UAC2_GET_RANGE => {
-                // この実装では単一レートのみ対応するため min/max を同じ値で返す。
-                let response = {
-                    let mut bytes = [0u8; 14];
-                    bytes[0..2].copy_from_slice(&1u16.to_le_bytes());
-                    bytes[2..6].copy_from_slice(&SAMPLE_RATE_HZ.to_le_bytes());
-                    bytes[6..10].copy_from_slice(&SAMPLE_RATE_HZ.to_le_bytes());
-                    bytes[10..14].copy_from_slice(&0u32.to_le_bytes());
-                    bytes
-                };
+                // 離散レート列として 44.1/48/88.2/96 kHz を返し、
+                // 各 alternate setting の wMaxPacketSize で実際の組み合わせを絞り込む。
+                let mut response = [0u8; 2 + SUPPORTED_SAMPLE_RATES_HZ.len() * 12];
+                response[0..2]
+                    .copy_from_slice(&(SUPPORTED_SAMPLE_RATES_HZ.len() as u16).to_le_bytes());
+                for (index, sample_rate_hz) in SUPPORTED_SAMPLE_RATES_HZ.iter().enumerate() {
+                    let offset = 2 + index * 12;
+                    response[offset..offset + 4].copy_from_slice(&sample_rate_hz.to_le_bytes());
+                    response[offset + 4..offset + 8].copy_from_slice(&sample_rate_hz.to_le_bytes());
+                    response[offset + 8..offset + 12].copy_from_slice(&0u32.to_le_bytes());
+                }
                 buf[..response.len()].copy_from_slice(&response);
                 Some(InResponse::Accepted(&buf[..response.len()]))
             }
@@ -261,11 +427,36 @@ impl Handler for UsbAudioClass {
 
     fn set_alternate_setting(&mut self, iface: InterfaceNumber, alternate: u8) {
         if iface == self.streaming_interface {
-            STREAM_ACTIVE.store(alternate == 1, Ordering::Relaxed);
+            let mut changed = false;
+            let active = matches!(alternate, 1 | 2);
+
+            if active {
+                let bits_per_sample = if alternate == 2 {
+                    BITS_PER_SAMPLE_24
+                } else {
+                    BITS_PER_SAMPLE_16
+                };
+                changed |= update_stream_format(bits_per_sample);
+
+                if !supports_stream_format(bits_per_sample, current_sample_rate_hz()) {
+                    changed |= update_sample_rate(SAMPLE_RATE_HZ);
+                }
+            }
+
+            STREAM_ACTIVE.store(active, Ordering::Relaxed);
+            if changed {
+                note_stream_config_change();
+            }
         }
     }
 
     fn reset(&mut self) {
         STREAM_ACTIVE.store(false, Ordering::Relaxed);
+        let mut changed = false;
+        changed |= update_stream_format(BITS_PER_SAMPLE_16);
+        changed |= update_sample_rate(SAMPLE_RATE_HZ);
+        if changed {
+            note_stream_config_change();
+        }
     }
 }

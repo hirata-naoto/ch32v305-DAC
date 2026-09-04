@@ -1,12 +1,11 @@
 #![no_std]
 #![no_main]
 
-use audio::USB_PACKET_SIZE;
 use ch32_hal::otg_fs::{self, Driver};
 use ch32_hal::usb::EndpointDataBuffer512;
 use ch32_hal::{self as hal, bind_interrupts, peripherals, Config};
 use embassy_executor::Spawner;
-use embassy_futures::join::join4;
+use embassy_futures::join::{join, join5};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_usb::driver::{Endpoint, EndpointError, EndpointIn, EndpointOut};
@@ -21,9 +20,8 @@ bind_interrupts!(struct Irq {
     OTG_FS => otg_fs::InterruptHandler<peripherals::OTG_FS>;
 });
 
-const USB_PACKET_WORDS: usize = USB_PACKET_SIZE / 2;
-const AUDIO_FIFO_CAPACITY_WORDS: usize = USB_PACKET_WORDS * 32;
-const I2S_DMA_BUFFER_WORDS: usize = USB_PACKET_WORDS * 4;
+const AUDIO_FIFO_CAPACITY_WORDS: usize = audio::MAX_I2S_PACKET_WORDS * 32;
+const I2S_DMA_BUFFER_WORDS: usize = audio::MAX_I2S_PACKET_WORDS * 4;
 
 static AUDIO_FIFO: Mutex<CriticalSectionRawMutex, AudioSampleFifo<AUDIO_FIFO_CAPACITY_WORDS>> =
     Mutex::new(AudioSampleFifo::new());
@@ -99,14 +97,41 @@ impl<const N: usize> AudioSampleFifo<N> {
     }
 }
 
-fn bytes_to_words(bytes: &[u8], out: &mut [u16]) -> usize {
-    let mut count = 0;
-    for sample_bytes in bytes.chunks_exact(2).take(out.len()) {
-        // USB から届く little-endian PCM16 を DMA 用の 16-bit サンプル列へ詰め替える。
-        out[count] = u16::from_le_bytes([sample_bytes[0], sample_bytes[1]]);
-        count += 1;
+fn bytes_to_i2s_words(bytes: &[u8], bits_per_sample: u8, out: &mut [u16]) -> usize {
+    match bits_per_sample {
+        audio::BITS_PER_SAMPLE_16 => {
+            let mut count = 0;
+            for sample_bytes in bytes.chunks_exact(2).take(out.len()) {
+                // USB から届く little-endian PCM16 を、そのまま I2S の 16-bit スロットへ並べる。
+                out[count] = u16::from_le_bytes([sample_bytes[0], sample_bytes[1]]);
+                count += 1;
+            }
+            count
+        }
+        audio::BITS_PER_SAMPLE_24 => {
+            let mut count = 0;
+            for sample_bytes in bytes.chunks_exact(3) {
+                if count + 1 >= out.len() {
+                    break;
+                }
+
+                // 24-bit PCM は 32-bit チャネル枠へ左詰めし、DMA からは上位 16 bit → 下位 16 bit の順で流す。
+                let sign = if (sample_bytes[2] & 0x80) != 0 {
+                    0xff
+                } else {
+                    0x00
+                };
+                let sample =
+                    i32::from_le_bytes([sample_bytes[0], sample_bytes[1], sample_bytes[2], sign]);
+                let aligned = ((sample << 8) as u32).to_be_bytes();
+                out[count] = u16::from_be_bytes([aligned[0], aligned[1]]);
+                out[count + 1] = u16::from_be_bytes([aligned[2], aligned[3]]);
+                count += 2;
+            }
+            count
+        }
+        _ => 0,
     }
-    count
 }
 
 #[embassy_executor::main(entry = "qingke_rt::entry")]
@@ -125,7 +150,7 @@ async fn main(_spawner: Spawner) -> ! {
     let _i2s_sd = p.PB15;
     let dma_buffer = I2S_DMA_BUFFER.init([0; I2S_DMA_BUFFER_WORDS]);
 
-    let mut endpoint_buffers: [EndpointDataBuffer512; 2] =
+    let mut endpoint_buffers: [EndpointDataBuffer512; 4] =
         core::array::from_fn(|_| EndpointDataBuffer512::default());
     let driver = Driver::new(p.OTG_FS, p.PA12, p.PA11, &mut endpoint_buffers);
 
@@ -155,24 +180,34 @@ async fn main(_spawner: Spawner) -> ! {
         &mut control_buf,
     );
 
-    let (audio_handler, mut stream_endpoint, mut feedback_endpoint) =
-        audio::UsbAudioClass::new(&mut builder);
+    let (
+        audio_handler,
+        mut stream_endpoint_16,
+        mut feedback_endpoint_16,
+        mut stream_endpoint_24,
+        mut feedback_endpoint_24,
+    ) = audio::UsbAudioClass::new(&mut builder);
     let audio_handler = AUDIO_HANDLER.init(audio_handler);
     builder.handler(audio_handler);
 
     let mut usb = builder.build();
     let mut i2s = i2s::I2s2Tx::new(p.DMA1_CH5, dma_buffer);
-    i2s.configure(audio::SAMPLE_RATE_HZ);
-    i2s.prime(&[0; USB_PACKET_WORDS]);
+    let mut silence = [0u16; audio::MAX_I2S_PACKET_WORDS];
+    i2s.configure(
+        audio::current_sample_rate_hz(),
+        audio::current_bits_per_sample(),
+    );
+    let initial_packet_words = audio::current_i2s_packet_words();
+    i2s.prime(&silence[..initial_packet_words]);
     i2s.start();
 
     let usb_fut = usb.run();
-    let receive_fut = async {
-        let mut packet = [0u8; USB_PACKET_SIZE];
-        let mut words = [0u16; USB_PACKET_WORDS];
+    let receive_16_fut = async {
+        let mut packet = [0u8; audio::USB_PACKET_SIZE_16];
+        let mut words = [0u16; audio::MAX_I2S_PACKET_WORDS];
 
         loop {
-            stream_endpoint.wait_enabled().await;
+            stream_endpoint_16.wait_enabled().await;
             {
                 // 新しいストリーム開始時は前回の残りを捨てて先頭から再生し直す。
                 let mut fifo = AUDIO_FIFO.lock().await;
@@ -180,11 +215,47 @@ async fn main(_spawner: Spawner) -> ! {
             }
 
             loop {
-                match stream_endpoint.read(&mut packet).await {
+                match stream_endpoint_16.read(&mut packet).await {
                     Ok(received) => {
-                        let word_count = bytes_to_words(&packet[..received], &mut words);
+                        let word_count = bytes_to_i2s_words(
+                            &packet[..received],
+                            audio::BITS_PER_SAMPLE_16,
+                            &mut words,
+                        );
                         let mut fifo = AUDIO_FIFO.lock().await;
-                        // USB 等時転送で受けた 1 ms 分の PCM を、I2S 側とは独立した FIFO へ積む。
+                        // USB 等時転送で受けた PCM を、I2S 側とは独立した FIFO へ積む。
+                        fifo.push_slice(&words[..word_count]);
+                    }
+                    Err(EndpointError::Disabled) => {
+                        let mut fifo = AUDIO_FIFO.lock().await;
+                        fifo.clear();
+                        break;
+                    }
+                    Err(EndpointError::BufferOverflow) => {}
+                }
+            }
+        }
+    };
+    let receive_24_fut = async {
+        let mut packet = [0u8; audio::USB_PACKET_SIZE_24];
+        let mut words = [0u16; audio::MAX_I2S_PACKET_WORDS];
+
+        loop {
+            stream_endpoint_24.wait_enabled().await;
+            {
+                let mut fifo = AUDIO_FIFO.lock().await;
+                fifo.clear();
+            }
+
+            loop {
+                match stream_endpoint_24.read(&mut packet).await {
+                    Ok(received) => {
+                        let word_count = bytes_to_i2s_words(
+                            &packet[..received],
+                            audio::BITS_PER_SAMPLE_24,
+                            &mut words,
+                        );
+                        let mut fifo = AUDIO_FIFO.lock().await;
                         fifo.push_slice(&words[..word_count]);
                     }
                     Err(EndpointError::Disabled) => {
@@ -198,13 +269,32 @@ async fn main(_spawner: Spawner) -> ! {
         }
     };
     let playback_fut = async {
-        let mut chunk = [0u16; USB_PACKET_WORDS];
+        let mut chunk = [0u16; audio::MAX_I2S_PACKET_WORDS];
+        let mut config_version = audio::stream_config_version();
 
         loop {
+            let next_config_version = audio::stream_config_version();
+            if next_config_version != config_version {
+                config_version = next_config_version;
+                let packet_words = audio::current_i2s_packet_words();
+                {
+                    let mut fifo = AUDIO_FIFO.lock().await;
+                    fifo.clear();
+                }
+                // フォーマットやレートが切り替わったら I2S 分周とデータ長を更新し、古い残留データを無音で置き換える。
+                i2s.configure(
+                    audio::current_sample_rate_hz(),
+                    audio::current_bits_per_sample(),
+                );
+                silence[..packet_words].fill(0);
+                i2s.prime(&silence[..packet_words]);
+            }
+
+            let packet_words = audio::current_i2s_packet_words();
             let written = {
                 let mut fifo = AUDIO_FIFO.lock().await;
                 if audio::STREAM_ACTIVE.load(core::sync::atomic::Ordering::Relaxed) {
-                    fifo.pop_slice(&mut chunk)
+                    fifo.pop_slice(&mut chunk[..packet_words])
                 } else {
                     fifo.clear();
                     0
@@ -212,17 +302,32 @@ async fn main(_spawner: Spawner) -> ! {
             };
 
             // FIFO が空のときは無音を補って、DMA の連続出力を途切れさせない。
-            chunk[written..].fill(0);
-            i2s.write_words(&chunk).await;
+            chunk[written..packet_words].fill(0);
+            i2s.write_words(&chunk[..packet_words]).await;
         }
     };
-    let feedback_fut = async {
+    let feedback_16_fut = async {
         loop {
-            feedback_endpoint.wait_enabled().await;
+            feedback_endpoint_16.wait_enabled().await;
 
             loop {
-                // 48 kHz 固定動作なので、ホストへは毎フレーム同じ 10.14 値を返す。
-                match feedback_endpoint.write(&audio::FEEDBACK_PACKET).await {
+                // 現在選択中のレートを 10.14 形式の明示的フィードバックで返し続ける。
+                let feedback_packet = audio::current_feedback_packet();
+                match feedback_endpoint_16.write(&feedback_packet).await {
+                    Ok(()) => {}
+                    Err(EndpointError::Disabled) => break,
+                    Err(EndpointError::BufferOverflow) => {}
+                }
+            }
+        }
+    };
+    let feedback_24_fut = async {
+        loop {
+            feedback_endpoint_24.wait_enabled().await;
+
+            loop {
+                let feedback_packet = audio::current_feedback_packet();
+                match feedback_endpoint_24.write(&feedback_packet).await {
                     Ok(()) => {}
                     Err(EndpointError::Disabled) => break,
                     Err(EndpointError::BufferOverflow) => {}
@@ -231,6 +336,16 @@ async fn main(_spawner: Spawner) -> ! {
         }
     };
 
-    join4(usb_fut, receive_fut, playback_fut, feedback_fut).await;
+    join(
+        usb_fut,
+        join5(
+            receive_16_fut,
+            receive_24_fut,
+            playback_fut,
+            feedback_16_fut,
+            feedback_24_fut,
+        ),
+    )
+    .await;
     loop {}
 }

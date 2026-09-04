@@ -36,10 +36,20 @@ impl<'d> I2s2Tx<'d> {
         }
     }
 
-    pub fn configure(&mut self, sample_rate_hz: u32) {
-        let divider = calculate_i2s_divider(sample_rate_hz);
+    pub fn configure(&mut self, sample_rate_hz: u32, bits_per_sample: u8) {
+        let divider = calculate_i2s_divider(sample_rate_hz, bits_per_sample);
         let prescaler = divider / 2;
         let odd = (divider & 0x01) != 0;
+        let (channel_length, data_length) = match bits_per_sample {
+            24 => (
+                pac::spi::vals::Chlen::BIT32,
+                pac::spi::vals::I2sdatlen::BIT24,
+            ),
+            _ => (
+                pac::spi::vals::Chlen::BIT16,
+                pac::spi::vals::I2sdatlen::BIT16,
+            ),
+        };
 
         // 設定変更前に SPI/I2S を停止して分周値とフォーマットを更新する。
         pac::SPI2.ctlr2().modify(|w| w.set_txdmaen(false));
@@ -53,8 +63,9 @@ impl<'d> I2s2Tx<'d> {
         });
 
         pac::SPI2.i2s_cfgr().write(|w| {
-            w.set_chlen(pac::spi::vals::Chlen::BIT16);
-            w.set_datlen(pac::spi::vals::I2sdatlen::BIT16);
+            // 24-bit は 32-bit チャネル長に載せ、DMA から 16-bit ワード 2 個で順に流す。
+            w.set_chlen(channel_length);
+            w.set_datlen(data_length);
             w.set_ckpol(false);
             w.set_i2sstd(pac::spi::vals::I2sstd::PHILIPS);
             w.set_pcmsync(false);
@@ -120,9 +131,13 @@ fn configure_gpio_port_b_pin_af(pin: usize) {
     }
 }
 
-fn calculate_i2s_divider(sample_rate_hz: u32) -> u16 {
-    let base = 32 * sample_rate_hz;
-    // 16-bit stereo のビットクロックに合わせて最も近い整数分周値を選ぶ。
+fn calculate_i2s_divider(sample_rate_hz: u32, bits_per_sample: u8) -> u16 {
+    let frame_bits = match bits_per_sample {
+        24 => 64,
+        _ => 32,
+    };
+    let base = frame_bits * sample_rate_hz;
+    // 16-bit は 32-bit frame、24-bit は 64-bit frame のビットクロックに合わせて分周値を選ぶ。
     let divider = ((I2S_CLOCK_HZ + (base / 2)) / base).clamp(4, 510);
     divider as u16
 }
